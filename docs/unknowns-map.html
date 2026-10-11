@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="description" content="PackCaptain 的四象限需求地图、已确认决定和实现前验证门。">
+  <title>PackCaptain · 需求地图</title>
+  <style>
+    :root { --paper: #f5f2e9; --ink: #202a27; --muted: #5b6860; --line: #cbd0c3; --green: #176246; --orange: #9d410f; }
+    * { box-sizing: border-box; }
+    html { scroll-padding-top: 1rem; }
+    body { margin: 0; background: var(--paper); color: var(--ink); font: 16px/1.75 system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+    a { color: var(--green); text-underline-offset: .22em; overflow-wrap: anywhere; }
+    a:focus-visible, summary:focus-visible { outline: 3px solid var(--orange); outline-offset: 4px; }
+    code, pre, .index, .eyebrow { font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; }
+    code { font-size: .88em; overflow-wrap: anywhere; }
+    main { max-width: 1160px; margin: auto; padding: 56px 36px 40px; }
+    header { padding-bottom: 32px; border-bottom: 3px solid var(--ink); }
+    .eyebrow { margin: 0 0 14px; color: var(--green); font-size: .8rem; letter-spacing: .08em; }
+    .title { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 14px; }
+    h1 { margin: 0; font-size: clamp(2.8rem, 7vw, 5.5rem); line-height: 1.1; letter-spacing: -.065em; }
+    .stamp { padding: 7px 12px; border: 1px solid var(--green); color: var(--green); font-size: .88rem; }
+    .lead { max-width: 750px; margin: 22px 0 12px; font-size: 1.22rem; }
+    .meta { margin: 0; color: var(--muted); font-size: .9rem; }
+    nav { display: flex; flex-wrap: wrap; gap: 9px 24px; padding: 20px 0; border-bottom: 1px solid var(--line); font-size: .9rem; }
+    .grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 0 32px; }
+    section { min-width: 0; padding: 30px 0; border-bottom: 1px solid var(--line); }
+    .section-head { display: flex; align-items: baseline; gap: 12px; }
+    .index { color: var(--green); font-size: .85rem; }
+    h2 { margin: 0 0 6px; font-size: 1.5rem; letter-spacing: -.02em; }
+    h3 { margin: 24px 0 7px; font-size: 1.05rem; }
+    p { margin: 9px 0; }
+    .subtitle, .source { color: var(--muted); font-size: .85rem; }
+    ul, ol { padding-left: 1.3em; }
+    li { padding-left: .15em; margin: 7px 0; }
+    .rule { margin-top: 18px; padding: 16px 18px; border-left: 3px solid var(--green); background: #e8eddf; }
+    .ledger { margin: 18px 0 0; }
+    .ledger div { padding: 12px 0; border-bottom: 1px dotted var(--line); }
+    .ledger dt { font-weight: 650; }
+    .ledger dd { margin: 5px 0 0; }
+    .owner { color: var(--green); font-size: .78rem; font-weight: 500; }
+    .risk { margin: 16px 0; padding: 14px 16px; border: 1px solid var(--line); }
+    .risk h3 { margin-top: 0; }
+    .tag { display: inline-block; margin-right: 7px; color: var(--green); font: 700 .72rem/1.5 ui-monospace, monospace; }
+    .open { color: var(--orange); }
+    .wide { grid-column: 1 / -1; }
+    .checklist li { margin-bottom: 12px; }
+    pre { margin: 16px 0 0; padding: 20px; background: var(--ink); color: #f3f3e7; white-space: pre-wrap; overflow-wrap: anywhere; font-size: .9rem; line-height: 1.8; }
+    footer { padding-top: 24px; color: var(--muted); font-size: .84rem; }
+    @media (max-width: 760px) {
+      main { padding: 30px 20px; }
+      .grid { grid-template-columns: minmax(0, 1fr); }
+      .lead { font-size: 1.06rem; }
+      section { padding: 24px 0; }
+      nav { gap: 10px 18px; }
+    }
+    @media print {
+      body { background: white; font-size: 10pt; }
+      main { max-width: none; padding: 0; }
+      h1 { font-size: 32pt; }
+      .grid { display: block; }
+      nav { display: none; }
+      section { padding: 16px 0; }
+      .risk, .ledger div, .rule, pre { break-inside: avoid; }
+      a { color: inherit; }
+      pre { background: #f0f0f0; color: black; border: 1px solid #999; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <p class="eyebrow">PRODUCT DISCOVERY / STAGE 05 / 2026-10-11</p>
+    <div class="title"><h1>PackCaptain</h1><span class="stamp">需求已签收 · 尚未实现</span></div>
+    <p class="lead">按项目管理与启停你的 skill 整合包。把本地配套 skills 组成 preset，一组开启、一组关闭，多个组合可以并存。</p>
+    <p class="meta">Grilling 已完成整体确认。地图是本次会话的交付附件，不替代仓库约定的 GitHub spec issue。技术验证项保留在本页；它们不重新开放已签收的产品决定。</p>
+  </header>
+  <nav aria-label="地图章节">
+    <a href="#known">01 已知的已知</a><a href="#decisions">02 已知的未知</a><a href="#preferences">03 未知的已知</a><a href="#risks">04 未知的未知</a><a href="#gates">验证门</a><a href="#handoff">下一步</a>
+  </nav>
+  <div class="grid">
+    <section id="known">
+      <div class="section-head"><span class="index">01</span><h2>已知的已知</h2></div>
+      <p class="subtitle">已经定下来的产品边界。</p>
+      <ul>
+        <li>产品叫 PackCaptain，命令名暂用 <code>packcaptain</code>，不做 macOS 图形应用。</li>
+        <li>首批支持 Claude Code、Codex、Pi，展示本地 skills 的来源、scope 与状态，并支持单项开关。</li>
+        <li>Preset 是本地 skills 的命名分组，定义全局共用，启停状态属于具体 target。Target 是 agent 与 scope 的组合。</li>
+        <li>应用时选择 agent，并可多选项目批量操作。同一个 target 可以同时开启多个 presets。</li>
+        <li>全局作为基础、项目作为补充。项目操作不屏蔽全局 skill；实际加载结果遵循各 agent 的原生规则。</li>
+        <li>初始化扫描 agent 目录并列出候选项目，由用户勾选纳入管理。之后可以主动添加目录。</li>
+        <li>用户从本地 skills 手动选择 preset 成员。第一版不自动导入作者整合包，不建设商店或展示依赖关系。</li>
+        <li>Agent 入口采用非交互 CLI 与 JSON 输出。TUI 和 CLI 共用同一套管理规则，第一版不另建 MCP 或 HTTP 服务。</li>
+        <li>统计只读取容易、稳定获取的现成数据。没有可用数据就不显示，不自建采集，不阻塞核心功能。</li>
+      </ul>
+      <div class="rule"><strong>核心工作流。</strong>发现本地 skills，手动创建 preset，选择管理目标，预览影响，再批量启停。切换作者套装不是强制互斥；用户可以自行关 A、开 B，也可以同时开启 A 和 B。</div>
+      <p class="source">文件依据为 <a href="../GLOSSARY.md">GLOSSARY.md</a>、<a href="adr/0001-presets-as-shared-composable-groups.md">Preset ADR</a> 与 <a href="research/agent-interface.md">agent 入口调研</a>。其余条目来源于本次会话中用户确认。</p>
+    </section>
+    <section id="decisions">
+      <div class="section-head"><span class="index">02</span><h2>已知的未知</h2></div>
+      <p class="subtitle">Decision ledger。产品决定已关闭，技术 OPEN 见验证门。</p>
+      <dl class="ledger">
+        <div><dt>分组而非模式 <span class="owner">user</span></dt><dd>Preset 是可组合的配套 skill 集合，不是互斥模式或完整快照。原因是同一项目可能同时需要多套整合包。</dd></div>
+        <div><dt>共享成员按并集保护 <span class="owner">user</span></dt><dd>关闭一个 preset 时，仍被其他已开启 preset 需要的 skill 不关闭。单项手动关闭仍允许。</dd></div>
+        <div><dt>重新开启整组覆盖此前单项关闭 <span class="owner">user</span></dt><dd>明确开启 preset 时，全部可用成员开启。这是用户本次整组开启的明确意图，不设永久阻挡状态。</dd></div>
+        <div><dt>修改定义后确认同步 <span class="owner">user</span></dt><dd>展示成员变更，确认后同步到已开启该 preset 的 targets。未开启该 preset 的目标不受影响。</dd></div>
+        <div><dt>同步时允许保留或恢复手动关闭 <span class="owner">user</span></dt><dd>仅在存在相关旧成员时显示选择。TUI 预选保持关闭，用户确认后执行；选择只影响本次同步。</dd></div>
+        <div><dt>恢复范围限定 <span class="owner">user · 已整体签收</span></dt><dd>仅处理当前 preset 中仍保留的相关旧成员及所选 targets。新增成员正常开启；缺失或不支持不算手动关闭。</dd></div>
+        <div><dt>非交互调用必须显式处理冲突 <span class="owner">user · 已整体签收</span></dt><dd>拟采用 <code>--closed-members=keep|restore</code>。存在冲突而未给策略时，返回影响清单和错误，不写入。</dd></div>
+        <div><dt>项目由用户认领 <span class="owner">user</span></dt><dd>扫描只发现候选，不自动纳入管理；后续可添加指定目录。多项目通过多选满足，本轮没有另外确定命名项目组的需求。</dd></div>
+        <div><dt>CLI 优先 <span class="owner">user 委托 · 调研后已签收</span></dt><dd>采用成熟的非交互命令与 JSON 输出惯例，减少第一版接入成本。不是认定 MCP 不成熟，也不是假定 Pi 不支持 MCP。</dd></div>
+        <div><dt>装饰性统计不扩张为采集工程 <span class="owner">user</span></dt><dd>不建设 hooks、埋点、遥测接收器或独立统计账本。没有稳定可读数据就不做。</dd></div>
+        <div><dt>名字确定 <span class="owner">user</span></dt><dd>PackCaptain 表达整合包与管理者的感觉。公开搜索未发现明确同名独立软件，但包名、域名和商标未完成核验。</dd></div>
+      </dl>
+    </section>
+    <section id="preferences">
+      <div class="section-head"><span class="index">03</span><h2>未知的已知</h2></div>
+      <p class="subtitle">通过具体例子抽出来的偏好与工作习惯。</p>
+      <ul>
+        <li><strong>消费者是终端用户，也包括他们调用的 agents。</strong>这让非交互接口成为第一版需求，而不是用自动按键控制 TUI。</li>
+        <li><strong>整合包比配置模式更贴近心智。</strong>用户想体验不同工程师的配套 skills，也可能组合使用。这改变了 preset 的可组合性与共享成员规则。</li>
+        <li><strong>明确点击开启整组，就是全开。</strong>这否定了持续拦截整组开启的手动关闭覆盖方案。</li>
+        <li><strong>用具体选项控制例外。</strong>编辑分组与重新开启分组分开处理，保留或恢复旧成员由本次选择决定。</li>
+        <li><strong>项目数量多。</strong>这让初始化发现后勾选，以及多项目批量应用进入第一版。</li>
+        <li><strong>界面参考可搜索多选列表。</strong>采用搜索、方向键移动、空格勾选、回车确认的交互方向。参考来自用户提供的截图，不是尚未制作的产品原型。</li>
+        <li><strong>用户反对冗余。</strong>Preset 是中心，统计是装饰。商店、依赖求解和多套接口不进入第一版。</li>
+        <li><strong>名字必须有管理感。</strong>纯材质和氛围名字被放弃，同名独立软件原则上排除，最终选择 PackCaptain。</li>
+      </ul>
+    </section>
+    <section id="risks">
+      <div class="section-head"><span class="index">04</span><h2>未知的未知</h2></div>
+      <p class="subtitle">盲点与边界。发现已披露，但不伪装成已经实测。</p>
+      <article class="risk"><h3><span class="tag">DECIDED</span>多个 preset 重叠</h3><p>直接逐组删除入口会误关共享成员。已决定保护仍被其他开启组需要的成员，并允许单项调整。</p><p class="source">证据为用户给出的 A、B、C 项目与多组并存场景，以及 Preset ADR。</p></article>
+      <article class="risk"><h3><span class="tag">SHARP EDGE</span>共享源文件不能当入口删除</h3><p>停用某个 target 不得删除其他 targets 共用的 skill 内容。软链接是可选机制，不是已确定实现，也不能统计使用次数。</p><p class="source">这是文件管理的设计风险，实际共享关系尚未扫描；写入前必须核验。</p></article>
+      <article class="risk"><h3><span class="tag open">OPEN</span>各 agent 加载与停用能力不同</h3><p>不能用统一的目录假设冒充有效状态。需核验所支持版本的发现路径、同名解析、停用机制和是否需要新会话生效。</p><p class="source">已读 <a href="https://code.claude.com/docs/en/skills">Claude Skills</a> 与 <a href="https://pi.dev/docs/latest/skills">Pi Skills</a>。实际适配机制仍未实现或验证。</p></article>
+      <article class="risk"><h3><span class="tag">DECIDED</span>原生事件不等于现成统计结果</h3><p>Claude 有原生报告，Codex 有原生事件，这不自动意味着存在稳定的累计统计接口。不为装饰性数字建设采集系统。</p><p class="source">依据 <a href="https://code.claude.com/docs/en/skills#find-unused-skills">Claude skill-doctor</a> 和 <a href="https://raw.githubusercontent.com/openai/codex/rust-v0.162.1/codex-rs/otel/README.md">Codex 固定版本文档</a>。CodeBurn 的完整截图计数与成本公式未核实。</p></article>
+      <article class="risk"><h3><span class="tag">SHARP EDGE</span>扫描不是授权写入</h3><p>候选目录要由用户认领；用户全局目录不能误归为项目。CLI 必须明确 targets，不能缺省改所有项目。</p><p class="source">依据用户确认的初始化选择流程与 <a href="research/agent-interface.md">入口调研决定</a>。</p></article>
+    </section>
+    <section id="gates" class="wide">
+      <div class="section-head"><span class="index">GATE</span><h2>实现者写代码前要确认的事实</h2></div>
+      <p>没有阻塞需求澄清的 OPEN。以下是技术验证门，不是可以静默忽略的脚注。允许进入隔离环境调查与实现准备；相关验证通过前，不对真实 agent 安装目录执行写入。</p>
+      <ol class="checklist">
+        <li><strong>OPEN · Agent 能力。</strong>核验 Claude Code、Codex、Pi 支持版本的项目与用户级路径、链接处理、同名解析、停用和刷新行为。用临时目录里的最小 skills 验证，给每种适配器记录结果。</li>
+        <li><strong>OPEN · 安全入口管理。</strong>区分真实文件、符号链接与已有非托管入口。验证共享源保护、外部变更、失败回滚、并发写入和幂等重试；未经验证不操作真实 skills。</li>
+        <li><strong>OPEN · 身份与状态存储。</strong>确定重复名称、同源多入口、移动目录、失效路径的识别规则。可靠地区分手动关闭、缺失与不支持，不能从入口缺失猜测用户意图。</li>
+        <li><strong>OPEN · 项目扫描。</strong>验证扫描范围、权限失败、链接循环和候选根目录识别。扫描不修改文件，明确说明漏扫范围。没有 agent 配置目录的项目仍可由用户主动添加。</li>
+        <li><strong>OPEN · 技术栈与成熟依赖。</strong>根据 TUI、分发和文件管理需要选择成熟库。尚未选择语言、TUI 框架或存储格式，不把这些当成已批准方案。</li>
+        <li><strong>OPEN · 可选统计与名称发布。</strong>只有现成统计接口足够稳定才接入；否则跳过。发布或注册前核验实际分发渠道的包名。两项都不阻塞 preset 开发。</li>
+      </ol>
+      <p class="source">正式 issue 与 spec 遵循 <a href="agents/issue-tracker.md">仓库 GitHub Issues 约定</a>。本轮没有发布 issue、提交或推送，也没有改动 agent 配置。</p>
+    </section>
+    <section id="handoff" class="wide">
+      <div class="section-head"><span class="index">NEXT</span><h2>可复制的下一步 prompt</h2></div>
+      <p>本次 walk 已完成。生成这条 prompt 不代表已经开始实现；没有附加 build plan，也没有假称计划已获批准。</p>
+      <pre>根据 docs/unknowns-map.html 开始 PackCaptain 的实现准备与开发。
+先读取 AGENTS.md、GLOSSARY.md、Preset ADR 和 agent 入口调研。
+遵循仓库约定，准备正式 GitHub spec issue；外部发布前确认授权。
+先在临时目录验证三个 agent 的发现与安全开关机制，再实现 preset 核心。
+把地图中的技术 OPEN 逐项验证并记录，未经验证不改真实安装目录。
+TUI 与非交互 CLI 共用管理规则，CLI 提供 JSON、预览和明确目标操作。
+不增加统计采集、商店、依赖求解、自动作者整合包导入或 MCP 服务。
+若实现发现事实与地图冲突，先展示证据并更新决定，不默默改变产品语义。</pre>
+    </section>
+  </div>
+  <footer>交付依据为本次会话中用户的确认，以及页面链接的实际文档。本文不是运行截图、性能报告或已实现功能清单。单文件、内联样式，无脚本或外部字体与资源请求。</footer>
+</main>
+</body>
+</html>
