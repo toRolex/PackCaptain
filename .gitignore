@@ -1,0 +1,11 @@
+/target/
+/.impeccable/
+/.pi/subagents/
+.DS_Store
+.env
+.env.*
+!.env.example
+**/auth.json
+**/credentials.json
+*.pem
+*.key
