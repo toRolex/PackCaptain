@@ -3,7 +3,7 @@ use std::{
     io::{Read, Write},
     path::PathBuf,
     process::Command,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -23,15 +23,20 @@ fn evidence() -> PathBuf {
         })
 }
 
+/// Bounded PTY session: every key waits on a rendered frame, the child is
+/// killed by a watchdog, the transcript is flushed continuously, and the
+/// reader is joined through a channel with a timeout instead of an
+/// unbounded `join`.
 struct Session {
-    _master: Box<dyn portable_pty::MasterPty + Send>,
-    writer: Option<Box<dyn Write + Send>>,
     child: Box<dyn Child + Send + Sync>,
-    reader: Option<thread::JoinHandle<()>>,
+    writer: Box<dyn Write + Send>,
     raw: Arc<Mutex<Vec<u8>>>,
+    transcript_path: PathBuf,
+    observations: String,
     name: String,
     started: Instant,
-    observations: String,
+    watchdog_stop: mpsc::Sender<()>,
+    reader_done: mpsc::Receiver<()>,
 }
 
 impl Session {
@@ -56,136 +61,203 @@ impl Session {
         command.cwd(fixture.root.path());
         let child = pair.slave.spawn_command(command).unwrap();
         drop(pair.slave);
-        let mut reader = pair.master.try_clone_reader().unwrap();
+        fs::create_dir_all(evidence()).unwrap();
+        let transcript_path = evidence().join(format!("{name}.transcript.bin"));
+        let log = fs::File::create(&transcript_path).unwrap();
         let raw = Arc::new(Mutex::new(Vec::new()));
-        let capture = raw.clone();
-        let reader = thread::spawn(move || {
+        let capture = Arc::clone(&raw);
+        let mut reader = pair.master.try_clone_reader().unwrap();
+        let (done_tx, reader_done) = mpsc::channel();
+        thread::spawn(move || {
+            let mut log = log;
             let mut buf = [0; 8192];
             while let Ok(count) = reader.read(&mut buf) {
                 if count == 0 {
                     break;
                 }
+                let _ = log.write_all(&buf[..count]);
+                let _ = log.sync_data();
                 capture.lock().unwrap().extend_from_slice(&buf[..count]);
             }
+            let _ = done_tx.send(());
         });
-        let session = Self {
-            writer: Some(pair.master.take_writer().unwrap()),
-            _master: pair.master,
+        let (watchdog_stop, stop_rx) = mpsc::channel();
+        let mut killer = child.clone_killer();
+        thread::spawn(move || {
+            if matches!(
+                stop_rx.recv_timeout(Duration::from_secs(55)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ) {
+                let _ = killer.kill();
+            }
+        });
+        Self {
             child,
-            reader: Some(reader),
+            writer: pair.master.take_writer().unwrap(),
             raw,
+            transcript_path,
+            observations: String::new(),
             name: name.into(),
             started: Instant::now(),
-            observations: String::new(),
-        };
-        thread::sleep(Duration::from_millis(500));
-        session
-    }
-
-    fn key(&mut self, bytes: &[u8]) {
-        let writer = self.writer.as_mut().unwrap();
-        writer.write_all(bytes).unwrap();
-        writer.flush().unwrap();
-        thread::sleep(Duration::from_millis(100));
+            watchdog_stop,
+            reader_done,
+        }
     }
 
     fn screen(&self) -> pty_screen::Screen {
-        pty_screen::Screen::replay(&self.raw.lock().unwrap(), 18, 120)
+        let raw = self.raw.lock().unwrap();
+        // Text-input draws finish with Show instead of Hide.
+        let normalized = String::from_utf8_lossy(&raw).replace("\x1b[?25h", "\x1b[?25l");
+        pty_screen::Screen::replay(normalized.as_bytes(), 18, 120)
     }
 
-    fn wait_screen(
-        &mut self,
-        label: &str,
-        after_frame: usize,
-        predicate: impl Fn(&pty_screen::Screen) -> bool,
-    ) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+    fn text(&self) -> String {
+        self.screen().text()
+    }
+
+    fn selected(&self) -> String {
+        self.text()
+            .lines()
+            .map(|line| line.trim_matches('│').trim())
+            .find(|line| line.starts_with("› "))
+            .unwrap_or("")
+            .to_owned()
+    }
+
+    fn key(&mut self, bytes: &[u8]) {
+        self.writer.write_all(bytes).unwrap();
+        self.writer.flush().unwrap();
+    }
+
+    /// Send bytes and wait for a new frame whose screen satisfies `predicate`.
+    fn key_when(&mut self, bytes: &[u8], label: &str, predicate: impl Fn(&str) -> bool) {
+        // Let pending renders settle so `before` cannot match a frame drawn
+        // for the previous key.
+        let mut last = self.screen().frames;
+        let quiesce = Instant::now() + Duration::from_secs(1);
+        loop {
+            thread::sleep(Duration::from_millis(40));
+            let now = self.screen().frames;
+            if now == last || Instant::now() > quiesce {
+                break;
+            }
+            last = now;
+        }
+        let before = last;
+        self.observations.push_str(&format!(
+            "send {label} elapsed_ms={} after_frame={before}\n",
+            self.started.elapsed().as_millis()
+        ));
+        self.key(bytes);
+        let deadline = Instant::now() + Duration::from_secs(4);
         loop {
             let screen = self.screen();
-            if screen.frames > after_frame && predicate(&screen) {
-                self.observations.push_str(&format!(
-                    "{label} elapsed_ms={} bytes={} frames={} viewport=18x120\n{}\n",
-                    self.started.elapsed().as_millis(),
-                    self.raw.lock().unwrap().len(),
-                    screen.frames,
-                    screen.text(),
-                ));
+            if screen.frames > before && predicate(&screen.text()) {
                 return;
             }
             assert!(
                 Instant::now() < deadline,
-                "{label}: render did not reach expected state; frames={} selected={:?}\n{}",
-                screen.frames,
-                screen.selected(),
+                "{label}: render did not reach expected state; selected={:?} transcript {}\n{}",
+                self.selected(),
+                self.transcript_path.display(),
                 screen.text()
             );
-            thread::sleep(Duration::from_millis(5));
+            assert!(
+                self.child.try_wait().unwrap().is_none(),
+                "PTY child exited during {label}\n{}",
+                screen.text()
+            );
+            thread::sleep(Duration::from_millis(10));
         }
     }
 
-    fn key_observed(
-        &mut self,
-        bytes: &[u8],
-        label: &str,
-        predicate: impl Fn(&pty_screen::Screen) -> bool,
-    ) {
-        let before = self.screen().frames;
-        self.observations.push_str(&format!(
-            "send {label} elapsed_ms={} after_frame={before} bytes={bytes:?}\n",
-            self.started.elapsed().as_millis()
-        ));
-        let writer = self.writer.as_mut().unwrap();
-        writer.write_all(bytes).unwrap();
-        writer.flush().unwrap();
-        self.wait_screen(label, before, predicate);
+    /// Wait for the first frame containing `expected` without sending keys.
+    fn wait_for(&mut self, expected: &str) {
+        let deadline = Instant::now() + Duration::from_secs(4);
+        loop {
+            let screen = self.screen();
+            if screen.frames > 0 && screen.text().contains(expected) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "initial frame missing {expected}; transcript {}\n{}",
+                self.transcript_path.display(),
+                screen.text()
+            );
+            assert!(
+                self.child.try_wait().unwrap().is_none(),
+                "PTY child exited at startup"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
-    fn down(&mut self, count: usize) {
-        for _ in 0..count {
+    fn step(&mut self, bytes: &[u8], label: &str, expected: &str) {
+        self.key_when(bytes, label, |text| text.contains(expected));
+    }
+
+    /// Press Down until the selected row matches `needle`, bounded by the
+    /// number of rows on screen.
+    fn select_row(&mut self, needle: &str) {
+        for attempt in 0..12 {
+            if self.selected().contains(needle) {
+                return;
+            }
+            let before = self.screen().frames;
             self.key(b"\x1b[B");
-        }
-    }
-
-    fn search(&mut self, name: &str) {
-        self.key(b"/");
-        self.key(name.as_bytes());
-        self.key(b"\r");
-    }
-
-    fn text(&self) -> String {
-        let raw = self.raw.lock().unwrap();
-        let mut visible = Vec::new();
-        let mut cursor = 0;
-        while cursor < raw.len() {
-            if raw[cursor] == 0x1b && raw.get(cursor + 1) == Some(&b'[') {
-                cursor += 2;
-                while cursor < raw.len() {
-                    let byte = raw[cursor];
-                    cursor += 1;
-                    if (0x40..=0x7e).contains(&byte) {
-                        break;
-                    }
+            let deadline = Instant::now() + Duration::from_secs(4);
+            loop {
+                let screen = self.screen();
+                if screen.frames > before {
+                    break;
                 }
-            } else {
-                visible.push(raw[cursor]);
-                cursor += 1;
+                assert!(
+                    Instant::now() < deadline,
+                    "{needle}: no frame after Down (attempt {attempt}); transcript {}\n{}",
+                    self.transcript_path.display(),
+                    screen.text()
+                );
+                assert!(
+                    self.child.try_wait().unwrap().is_none(),
+                    "PTY child exited selecting {needle}"
+                );
+                thread::sleep(Duration::from_millis(10));
             }
         }
-        String::from_utf8_lossy(&visible).into_owned()
+        panic!(
+            "row {needle} never selected; selected={:?} transcript {}",
+            self.selected(),
+            self.transcript_path.display()
+        );
     }
 
     fn finish(mut self, expected: &[&str]) {
+        // A bare ESC followed immediately by q is parsed as Alt+q, which
+        // would skip the cancel frame; keep the two keys in separate reads.
+        thread::sleep(Duration::from_millis(200));
         self.key(b"q");
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(4);
         let status = loop {
             if let Some(status) = self.child.try_wait().unwrap() {
                 break status;
             }
-            assert!(Instant::now() < deadline, "TUI did not exit");
-            thread::sleep(Duration::from_millis(50));
+            assert!(
+                Instant::now() < deadline,
+                "TUI did not exit; transcript {}\n{}",
+                self.transcript_path.display(),
+                self.text()
+            );
+            thread::sleep(Duration::from_millis(20));
         };
-        self.writer.take();
-        self.reader.take().unwrap().join().unwrap();
+        let _ = self.watchdog_stop.send(());
+        assert!(
+            self.reader_done
+                .recv_timeout(Duration::from_secs(2))
+                .is_ok(),
+            "PTY reader did not finish; transcript {}",
+            self.transcript_path.display()
+        );
         self.observations.push_str(&format!(
             "q exit={status:?} elapsed_ms={}\n",
             self.started.elapsed().as_millis()
@@ -196,8 +268,9 @@ impl Session {
         for expected in expected {
             assert!(
                 text.contains(expected),
-                "missing {expected} in {}",
-                self.name
+                "missing {expected} in {} (transcript {})",
+                self.name,
+                self.transcript_path.display()
             );
         }
     }
@@ -205,27 +278,29 @@ impl Session {
     fn save(&self) {
         fs::create_dir_all(evidence()).unwrap();
         fs::write(
-            evidence().join(format!("{}.bin", self.name)),
-            &*self.raw.lock().unwrap(),
-        )
-        .unwrap();
-        fs::write(evidence().join(format!("{}.txt", self.name)), self.text()).unwrap();
-        fs::write(
             evidence().join(format!("{}.viewport.log", self.name)),
             &self.observations,
         )
         .unwrap();
+        fs::write(evidence().join(format!("{}.txt", self.name)), self.text()).unwrap();
     }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
-        if self.reader.is_some() {
-            let _ = self.child.kill();
-            self.writer.take();
-            if let Some(reader) = self.reader.take() {
-                let _ = reader.join();
-            }
+        let _ = self.child.kill();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while matches!(self.child.try_wait(), Ok(None)) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        let _ = self.watchdog_stop.send(());
+        let _ = self.reader_done.recv_timeout(Duration::from_secs(2));
+        if thread::panicking() {
+            eprintln!(
+                "failure transcript {}\nlast screen:\n{}",
+                self.transcript_path.display(),
+                self.text()
+            );
         }
         self.save();
     }
@@ -336,32 +411,48 @@ impl Fixture {
         }
     }
 
-    fn select(&self, session: &mut Session, targets: &[String], editing: bool) {
-        let rows = self.cli(&["targets", "list"]);
-        let ids: Vec<_> = rows
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|row| {
-                !editing
-                    || self
-                        .targets
-                        .contains(&row["id"].as_str().unwrap().to_owned())
-            })
-            .map(|row| row["id"].as_str().unwrap())
-            .collect();
-        for _ in 0..ids.len() {
-            session.key(b"\x1b[A");
+    /// From the scope root, enter project `index` and land on its PresetList.
+    fn enter_project(&self, session: &mut Session, index: usize) {
+        // Wait for the first home frame so keys cannot race raw-mode setup
+        // (an early Enter would be echoed as a bare control byte).
+        session.wait_for("全局");
+        let needle = format!("project-{index}");
+        session.select_row(&needle);
+        session.step(b"\r", &format!("enter {needle}"), "Skills 管理");
+    }
+
+    /// From a project PresetList, open the preset action menu.
+    fn open_preset_actions(&self, session: &mut Session) {
+        session.step(b"\r", "open preset actions", "开启（选择 agents）");
+    }
+
+    /// From a project PresetList, open the preset and reach the target
+    /// checkbox screen for 开启/关闭.
+    fn preset_toggle_targets(&self, session: &mut Session, enable: bool) {
+        self.open_preset_actions(session);
+        if enable {
+            session.step(b"\r", "choose enable", "选择当前作用域 agents");
+        } else {
+            session.step(b"\x1b[B", "choose close", "关闭（选择 agents）");
+            session.step(b"\r", "confirm close", "选择当前作用域 agents");
         }
-        for (index, id) in ids.iter().enumerate() {
-            if index > 0 {
-                session.down(1);
-            }
-            if targets.iter().any(|target| target == id) {
-                session.key(b" ");
-            }
+    }
+
+    /// From a project PresetList, open a skill and reach the target checkbox
+    /// screen for enabling/disabling it.
+    fn skill_toggle_targets(&self, session: &mut Session, skill: &str, enable: bool) {
+        session.select_row("Skills 管理");
+        session.step(b"\r", "open skill pick", "Skills 清单");
+        session.step(b"/", "start search", "输入搜索词");
+        session.step(skill.as_bytes(), "type filter", skill);
+        session.step(b"\r", "end search", "Skills 清单");
+        session.step(b"\r", "open skill actions", "Skill 操作");
+        if enable {
+            session.step(b"\r", "choose enable skill", "选择当前作用域 agents");
+        } else {
+            session.step(b"\x1b[B", "choose disable skill", "关闭");
+            session.step(b"\r", "confirm disable skill", "选择当前作用域 agents");
         }
-        session.key(b"\r");
     }
 
     fn links(&self, index: usize) -> Vec<(String, PathBuf)> {
@@ -399,20 +490,67 @@ impl Fixture {
         assert_eq!(actual, expected);
     }
 
-    fn edit(&self, name: &str, skill: &str, targets: &[String], cancel: bool) {
+    /// Edit shared members inside project `index`'s scope: add or remove
+    /// `skill` on that scope's preset-enabled targets, then confirm or cancel.
+    fn edit_members(
+        &self,
+        name: &str,
+        index: usize,
+        skill: &str,
+        remove: bool,
+        toggle: bool,
+        cancel: bool,
+    ) {
         let mut session = Session::start(self, name);
-        session.key(b"u");
-        session.search(skill);
-        session.key(b" ");
-        session.key(b"\r");
-        self.select(&mut session, targets, true);
-        assert!(session.text().contains("影响预览"));
+        self.enter_project(&mut session, index);
+        self.open_preset_actions(&mut session);
+        session.step(b"\x1b[B", "menu down 1", "关闭（选择 agents）");
+        session.step(b"\x1b[B", "menu down 2", "编辑共享成员并同步");
+        session.step(b"\r", "open member edit", "仅支持同步保存");
+        for _ in 0..6 {
+            session.step(b"\x1b[A", "cursor up", "仅支持同步保存");
+        }
+        session.step(b"/", "member search", "输入搜索词");
+        session.step(skill.as_bytes(), "member filter", skill);
+        session.step(b"\r", "member filter end", "仅支持同步保存");
+        let want = if remove { "[ ]" } else { "[x]" };
+        if toggle {
+            session.key_when(b" ", "toggle member", move |text| {
+                text.lines().any(|line| {
+                    let line = line.trim_matches('│').trim();
+                    line.starts_with("› ") && line.contains(want) && line.contains(skill)
+                })
+            });
+        } else {
+            let deadline = Instant::now() + Duration::from_secs(4);
+            loop {
+                let selected = session.selected();
+                if selected.contains(skill) && selected.contains(want) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "member row {skill} not in state {want}: {selected}"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        session.step(
+            b"\r",
+            "choose sync targets",
+            "选择已开启此 Preset 的 agents",
+        );
+        session.step(b" ", "check target", "[x]");
+        session.step(b"\r", "member preview", "影响预览");
         session.key(if cancel { b"\x1b" } else { b"\r" });
-        session.finish(&[if cancel {
+        let expected = if cancel {
+            // EditMembers is its own cancel source screen and its refresh does
+            // not replace the notice, so the cancel feedback stays visible.
             "已取消，未写入"
         } else {
             "执行成功"
-        }]);
+        };
+        session.finish(&[expected]);
     }
 }
 
@@ -444,32 +582,24 @@ fn pty_preview_then_external_shared_preset_enable_preserves_fresh_state() {
         .next()
         .unwrap();
     let mut session = Session::start(&fixture, "fresh-shared");
-    let presets = fixture.cli(&["presets", "list"]);
-    let index = presets
-        .as_array()
-        .unwrap()
-        .iter()
-        .position(|row| row["id"] == fixture.preset)
-        .unwrap();
-    session.down(index);
-    session.key(b"e");
-    fixture.select(&mut session, &fixture.targets[..1], false);
-    assert!(session.text().contains("影响预览"));
+    fixture.enter_project(&mut session, 0);
+    fixture.preset_toggle_targets(&mut session, true);
+    session.step(b" ", "check target", "[x]");
+    session.step(b"\r", "preview enable", "影响预览");
     fixture.cli(&["presets", "enable", other, "--target", &fixture.targets[0]]);
     let external =
         packcaptain::storage::StateStore::load_existing_snapshot(&fixture.state).unwrap();
     let external_links = fixture.links(0);
-    session.key(b"\r");
+    session.step(b"\r", "first confirm", "状态已变化，请重新确认");
     let actual = packcaptain::storage::StateStore::load_existing_snapshot(&fixture.state).unwrap();
     let target: packcaptain::domain::TargetId = fixture.targets[0].parse().unwrap();
     let preset = packcaptain::domain::PresetId::from(fixture.preset.as_str());
-    assert!(session.text().contains("状态已变化，请重新确认"));
     assert_eq!(
         actual, external,
         "first confirmation must not write business state"
     );
     assert_eq!(fixture.links(0), external_links);
-    session.key(b"\r");
+    session.step(b"\r", "second confirm", "执行成功");
     let actual = packcaptain::storage::StateStore::load_existing_snapshot(&fixture.state).unwrap();
     assert!(actual.targets[&target].presets[&preset].enabled);
     assert!(
@@ -498,7 +628,7 @@ fn pty_preview_then_external_shared_preset_enable_preserves_fresh_state() {
     assert_eq!(fixture.links(0), expected);
     assert!(fixture.links(1).is_empty());
     assert!(fixture.links(2).is_empty());
-    session.finish(&["执行成功"]);
+    session.finish(&[]);
     passed(
         "fresh-shared",
         "external preset, enabled skills and owned entries preserved after reopened SQLite; exact links on selected target only",
@@ -509,15 +639,16 @@ fn pty_preview_then_external_shared_preset_enable_preserves_fresh_state() {
 fn pty_changed_preview_rechecks_again_and_cancel_writes_nothing() {
     let fixture = Fixture::new(2);
     let mut session = Session::start(&fixture, "fresh-recheck-cancel");
-    session.key(b"e");
-    fixture.select(&mut session, &fixture.targets[..1], false);
+    fixture.enter_project(&mut session, 0);
+    fixture.preset_toggle_targets(&mut session, true);
+    session.step(b" ", "check target", "[x]");
+    session.step(b"\r", "preview enable", "影响预览");
     for skill in &fixture.skills {
         fixture.cli(&["skills", "enable", skill, "--target", &fixture.targets[0]]);
         let before =
             packcaptain::storage::StateStore::load_existing_snapshot(&fixture.state).unwrap();
         let links = fixture.links(0);
-        session.key(b"\r");
-        assert!(session.text().contains("状态已变化，请重新确认"));
+        session.step(b"\r", "recheck confirm", "状态已变化，请重新确认");
         assert_eq!(
             packcaptain::storage::StateStore::load_existing_snapshot(&fixture.state).unwrap(),
             before
@@ -525,9 +656,9 @@ fn pty_changed_preview_rechecks_again_and_cancel_writes_nothing() {
         assert_eq!(fixture.links(0), links);
     }
     let before = fixture.snapshot();
-    session.key(b"\x1b");
+    session.step(b"\x1b", "cancel", "开启（选择 agents）");
     assert_eq!(fixture.snapshot(), before);
-    session.finish(&["已取消，未写入"]);
+    session.finish(&[]);
     passed(
         "fresh-recheck-cancel",
         "two successive real CLI changes both require reconfirmation; Escape preserves entire semantic state and links",
@@ -545,12 +676,25 @@ fn pty_manual_close_during_preview_requires_explicit_policy() {
         &fixture.targets[0],
     ]);
     let mut session = Session::start(&fixture, "fresh-late-policy");
-    session.key(b"u");
-    session.search("Skill001");
-    session.key(b" ");
-    session.key(b"\r");
-    fixture.select(&mut session, &fixture.targets[..1], true);
-    assert!(session.text().contains("影响预览"));
+    fixture.enter_project(&mut session, 0);
+    fixture.open_preset_actions(&mut session);
+    session.step(b"\x1b[B", "menu down 1", "关闭（选择 agents）");
+    session.step(b"\x1b[B", "menu down 2", "编辑共享成员并同步");
+    session.step(b"\r", "open member edit", "仅支持同步保存");
+    for _ in 0..6 {
+        session.step(b"\x1b[A", "cursor up", "仅支持同步保存");
+    }
+    session.step(b"/", "member search", "输入搜索词");
+    session.step(b"Skill001", "member filter", "Skill001");
+    session.step(b"\r", "member filter end", "仅支持同步保存");
+    session.step(b" ", "toggle member", "[x]");
+    session.step(
+        b"\r",
+        "choose sync targets",
+        "选择已开启此 Preset 的 agents",
+    );
+    session.step(b" ", "check target", "[x]");
+    session.step(b"\r", "member preview", "影响预览");
     fixture.cli(&[
         "skills",
         "disable",
@@ -560,15 +704,14 @@ fn pty_manual_close_during_preview_requires_explicit_policy() {
     ]);
     let before = packcaptain::storage::StateStore::load_existing_snapshot(&fixture.state).unwrap();
     let links = fixture.links(0);
-    session.key(b"\r");
+    session.step(b"\r", "conflict confirm", "手动关闭冲突策略");
     assert_eq!(
         packcaptain::storage::StateStore::load_existing_snapshot(&fixture.state).unwrap(),
         before
     );
     assert_eq!(fixture.links(0), links);
-    assert!(session.text().contains("手动关闭冲突策略"));
-    session.key(b"\r");
-    session.key(b"\r");
+    session.step(b"\r", "keep policy", "影响预览");
+    session.step(b"\r", "policy confirm", "执行成功");
     let after = packcaptain::storage::StateStore::load_existing_snapshot(&fixture.state).unwrap();
     let target: packcaptain::domain::TargetId = fixture.targets[0].parse().unwrap();
     assert_eq!(
@@ -581,7 +724,7 @@ fn pty_manual_close_during_preview_requires_explicit_policy() {
             fixture.skills[1].as_str()
         )])
     );
-    session.finish(&["执行成功"]);
+    session.finish(&[]);
     passed(
         "fresh-late-policy",
         "new manual-close conflict writes nothing until explicit Keep selection and a fresh preview confirmation; closed member stays closed",
@@ -599,14 +742,16 @@ fn pty_foreign_replacement_after_preview_is_rejected_without_intent_change() {
         &fixture.targets[0],
     ]);
     let mut session = Session::start(&fixture, "fresh-foreign");
-    session.key(b"d");
-    fixture.select(&mut session, &fixture.targets[..1], false);
+    fixture.enter_project(&mut session, 0);
+    fixture.preset_toggle_targets(&mut session, false);
+    session.step(b" ", "check target", "[x]");
+    session.step(b"\r", "preview disable", "影响预览");
     let before = packcaptain::storage::StateStore::load_existing_snapshot(&fixture.state).unwrap();
     let path = fixture.projects[0].join(format!(".claude/skills/pc-{}", fixture.skills[0]));
     fs::remove_file(&path).unwrap();
     fs::create_dir(&path).unwrap();
     fs::write(path.join("foreign"), "do not touch").unwrap();
-    session.key(b"\r");
+    session.step(b"\r", "foreign confirm", "部分失败");
     assert_eq!(
         packcaptain::storage::StateStore::load_existing_snapshot(&fixture.state).unwrap(),
         before
@@ -615,7 +760,7 @@ fn pty_foreign_replacement_after_preview_is_rejected_without_intent_change() {
         fs::read_to_string(path.join("foreign")).unwrap(),
         "do not touch"
     );
-    session.finish(&["部分失败", "失败 1"]);
+    session.finish(&["失败 1"]);
     passed(
         "fresh-foreign",
         "foreign directory content and stored intent/owned metadata unchanged after rejected disable",
@@ -636,8 +781,10 @@ fn pty_pending_journal_is_not_consumed_by_confirmation() {
         &fixture.targets[0],
     ]);
     let mut session = Session::start(&fixture, "fresh-pending");
-    session.key(b"d");
-    fixture.select(&mut session, &fixture.targets[..1], false);
+    fixture.enter_project(&mut session, 0);
+    fixture.preset_toggle_targets(&mut session, false);
+    session.step(b" ", "check target", "[x]");
+    session.step(b"\r", "preview disable", "影响预览");
     let before = StateStore::load_existing_snapshot(&fixture.state).unwrap();
     let target: TargetId = fixture.targets[0].parse().unwrap();
     let skill = packcaptain::domain::SkillId::from(fixture.skills[0].as_str());
@@ -659,7 +806,7 @@ fn pty_pending_journal_is_not_consumed_by_confirmation() {
         (metadata.dev(), metadata.ino())
     };
     let links = fixture.links(0);
-    session.key(b"\r");
+    session.step(b"\r", "pending confirm", "存在未完成操作");
     assert_eq!(
         StateStore::load_existing_snapshot(&fixture.state).unwrap(),
         before
@@ -678,7 +825,7 @@ fn pty_pending_journal_is_not_consumed_by_confirmation() {
         let metadata = fs::symlink_metadata(&path).unwrap();
         assert_eq!((metadata.dev(), metadata.ino()), identity);
     }
-    session.finish(&["存在未完成操作，需先完成恢复后重新预览"]);
+    session.finish(&[]);
     passed(
         "fresh-pending",
         "real SQLite Applying journal retained byte-for-byte; snapshot and symlink no-follow device/inode/readlink preserved",
@@ -690,8 +837,8 @@ fn pty_members_add_remove_and_sync_only_explicit_targets() {
     let fixture = Fixture::new(2);
     fixture.enable_all();
     let before = fixture.snapshot();
-    let selected = fixture.targets[..2].to_vec();
-    fixture.edit("members-add", "Skill001", &selected, false);
+    fixture.edit_members("members-add-0", 0, "Skill001", false, true, false);
+    fixture.edit_members("members-add-1", 1, "Skill001", false, false, false);
     fixture.assert_members(&fixture.skills);
     for index in 0..2 {
         assert_eq!(fixture.links(index).len(), 2);
@@ -710,7 +857,8 @@ fn pty_members_add_remove_and_sync_only_explicit_targets() {
     };
     assert_eq!(row(&before), row(&after));
     assert_eq!(before["links"][2], after["links"][2]);
-    fixture.edit("members-remove", "Skill000", &selected, false);
+    fixture.edit_members("members-remove-0", 0, "Skill000", true, true, false);
+    fixture.edit_members("members-remove-1", 1, "Skill001", false, false, false);
     fixture.assert_members(&fixture.skills[1..]);
     for index in 0..2 {
         let links = fixture.links(index);
@@ -720,7 +868,7 @@ fn pty_members_add_remove_and_sync_only_explicit_targets() {
     assert_eq!(row(&before), row(&fixture.snapshot()));
     passed(
         "members-and-scope",
-        "added Skill001 and removed Skill000 on two explicit targets; third target state and links unchanged",
+        "added Skill001 and removed Skill000 on the two explicit project scopes; third target state and links unchanged",
     );
 }
 
@@ -729,7 +877,7 @@ fn pty_cancel_preserves_entire_semantic_state_and_links() {
     let fixture = Fixture::new(2);
     fixture.enable_all();
     let before = fixture.snapshot();
-    fixture.edit("cancel-edit", "Skill001", &fixture.targets[..2], true);
+    fixture.edit_members("cancel-edit", 0, "Skill001", false, true, true);
     assert_eq!(fixture.snapshot(), before);
     passed(
         "cancel",
@@ -738,32 +886,98 @@ fn pty_cancel_preserves_entire_semantic_state_and_links() {
 }
 
 #[test]
-fn pty_partial_failure_identifies_failed_target_and_success_count() {
+fn pty_failure_identifies_failed_target_and_preserves_success() {
+    use packcaptain::domain::{AgentId, PresetId, Scope, TargetId};
+    use packcaptain::storage::StateStore;
+
     let fixture = Fixture::new(1);
-    let mut session = Session::start(&fixture, "partial-failure");
-    session.key(b"e");
-    fixture.select(&mut session, &fixture.targets[..2], false);
-    assert!(session.text().contains("影响预览"));
-    let blocked = fixture.projects[1].join(".claude");
-    fs::write(&blocked, "foreign blocker").unwrap();
-    session.key(b"\r");
-    session.finish(&["部分失败", "成功 1", "失败 1", &fixture.targets[1]]);
-    assert_eq!(fixture.links(0).len(), 1);
-    assert_eq!(fs::read_to_string(blocked).unwrap(), "foreign blocker");
-    let targets = fixture.cli(&["targets", "list"]);
-    let successful = targets
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|row| row["id"] == fixture.targets[0])
-        .unwrap();
+    let codex = fixture.targets[0].replacen("claude-code:", "codex:", 1);
+    for target in [&fixture.targets[0], &codex] {
+        fixture.cli(&["presets", "enable", &fixture.preset, "--target", target]);
+    }
+    let before = StateStore::load_existing_snapshot(&fixture.state).unwrap();
+    let successful: TargetId = fixture.targets[0].parse().unwrap();
+    let failed: TargetId = codex.parse().unwrap();
+    assert_eq!(failed.agent, AgentId::Codex);
+    assert_eq!(failed.scope, successful.scope);
+    let Scope::Project(project_id) = &failed.scope else {
+        panic!("failure target must be project-scoped");
+    };
+    assert_eq!(before.projects[project_id].name, "project-0");
     assert_eq!(
-        successful["state"]["enabled_skills"],
-        json!([fixture.skills[0]])
+        before.projects[project_id].root,
+        fs::canonicalize(&fixture.projects[0]).unwrap()
     );
+    assert_eq!(
+        before
+            .projects
+            .values()
+            .filter(|project| project.name == "project-0")
+            .count(),
+        1
+    );
+    assert!(before.targets.contains_key(&failed));
+    let preset = PresetId::from(fixture.preset.as_str());
+    let expected_source = fs::canonicalize(fixture.home.join(".claude/skills/skill-000")).unwrap();
+    let blocked = fixture.projects[0].join(format!(".codex/skills/pc-{}", fixture.skills[0]));
+    assert_eq!(fs::read_link(&blocked).unwrap(), expected_source);
+    assert_eq!(
+        fixture.links(0),
+        vec![(format!("pc-{}", fixture.skills[0]), expected_source)]
+    );
+
+    let mut session = Session::start(&fixture, "partial-failure");
+    fixture.enter_project(&mut session, 0);
+    fixture.preset_toggle_targets(&mut session, false);
+    assert!(session.selected().contains("Claude Code"));
+    session.step(b" ", "check Claude", "[x] Claude Code");
+    session.select_row("Codex");
+    session.step(b" ", "check Codex", "[x] Codex");
+    session.step(b"\r", "preview both targets", "影响预览");
+    assert!(session.text().contains("Claude Code") && session.text().contains("Codex"));
+    assert_eq!(
+        StateStore::load_existing_snapshot(&fixture.state).unwrap(),
+        before
+    );
+
+    // A foreign replacement passes discovery but must fail the owned-link
+    // identity check during execution, without rolling back the other agent.
+    fs::remove_file(&blocked).unwrap();
+    fs::create_dir(&blocked).unwrap();
+    fs::write(blocked.join("foreign"), "do not touch").unwrap();
+    session.step(b"\r", "confirm mixed result", "部分失败");
+    session.finish(&[
+        "部分失败",
+        "成功 1",
+        "失败 1",
+        "Codex · project-0：skill entry was replaced:",
+    ]);
+
+    let after = StateStore::load_existing_snapshot(&fixture.state).unwrap();
+    assert!(!after.targets[&successful].presets[&preset].enabled);
+    assert!(after.targets[&successful].enabled_skills.is_empty());
+    assert!(after.targets[&successful].manual_closed.is_empty());
+    let skill = packcaptain::domain::SkillId::from(fixture.skills[0].as_str());
+    assert_eq!(after.entries[&successful].len(), 1);
+    let routes = &after.entries[&successful][&skill];
+    assert_eq!(routes.len(), 1);
+    assert!(!routes[0].active);
+    assert!(!routes[0].present);
+    assert_eq!(routes[0].entry_fingerprint, "missing");
+    assert_eq!(routes[0].path, before.entries[&successful][&skill][0].path);
+    assert!(fixture.links(0).is_empty());
+    assert_eq!(after.targets[&failed], before.targets[&failed]);
+    assert_eq!(after.entries[&failed], before.entries[&failed]);
+    assert!(fs::symlink_metadata(&blocked).unwrap().is_dir());
+    assert_eq!(fs::read_dir(&blocked).unwrap().count(), 1);
+    assert_eq!(
+        fs::read_to_string(blocked.join("foreign")).unwrap(),
+        "do not touch"
+    );
+    assert!(fixture.links(1).is_empty() && fixture.links(2).is_empty());
     passed(
         "partial-failure",
-        "PTY displays partial failure with success=1 failure=1 and failed target ID; successful target link applied and foreign blocker preserved",
+        "one project, one PTY confirmation, two real agents: success 1/failure 1 and unique failed Codex/project label mapped to snapshot TargetId; Claude disabled and link removed, Codex intent/entries and foreign directory preserved",
     );
 }
 
@@ -775,60 +989,86 @@ fn pty_long_list_scrolls_to_last_skill_and_back_without_crash() {
     ordered.sort_by_key(|row| row["id"].as_str().unwrap());
     assert_eq!(ordered.len(), 90);
     let name = |index: usize| ordered[index]["name"].as_str().unwrap();
+    let first = name(0);
     let last = name(89);
     let mut session = Session::start(&fixture, "long-list");
-    session.wait_screen("home", 0, |screen| screen.text().contains("Presets"));
-    for _ in 0..2 {
-        session.key_observed(b"\x1b[B", "home-down", |_| true);
-    }
-    session.key_observed(b"\r", "inventory", |screen| {
-        screen.text().contains("Skills 状态") && screen.selected().contains(name(0))
-    });
+    session.wait_for("全局");
+    session.step(b"\r", "enter global", "Skills 管理");
+    session.select_row("Skills 管理");
+    session.step(b"\r", "open inventory", "Skills 清单");
+    session.step(b"\r", "select first skill", "Skill 操作");
+    session.step(b"\x1b", "back to list", "Skills 清单");
     for index in 1..90 {
-        session.key_observed(b"\x1b[B", name(index), |screen| {
-            screen.selected().contains(name(index))
-        });
-    }
-    for _ in 0..6 {
-        session.key_observed(b"\x1b[B", "bottom-boundary", |screen| {
-            screen.selected().contains(last)
+        let expected = name(index).to_owned();
+        session.key_when(b"\x1b[B", name(index), move |text| {
+            text.lines().any(|line| {
+                let line = line.trim_matches('│').trim();
+                line.starts_with("› ") && line.contains(&expected)
+            })
         });
     }
     assert!(
-        session.screen().selected().contains(last),
+        session.selected().contains(last),
         "last skill was not rendered"
     );
-    for index in (0..89).rev() {
-        session.key_observed(b"\x1b[A", name(index), |screen| {
-            screen.selected().contains(name(index))
-        });
-    }
+    let bottom_row = session.selected();
     for _ in 0..6 {
-        session.key_observed(b"\x1b[A", "top-boundary", |screen| {
-            screen.selected().contains(name(0))
+        session.key(b"\x1b[B");
+        // FIFO input makes the theme frame a barrier for the preceding Down.
+        session.step(b"T", "bottom-boundary barrier", "主题 Catppuccin Latte");
+        assert_eq!(session.selected(), bottom_row, "bottom-boundary moved row");
+        assert!(
+            session.child.try_wait().unwrap().is_none(),
+            "PTY child exited at bottom-boundary"
+        );
+        session.observations.push_str(&format!(
+            "bottom-boundary selected={bottom_row:?} alive=true frames={}\n",
+            session.screen().frames
+        ));
+        session.step(
+            b"T",
+            "bottom-boundary restore theme",
+            "主题 Catppuccin Mocha",
+        );
+        assert_eq!(session.selected(), bottom_row);
+    }
+    for index in (0..89).rev() {
+        let expected = name(index).to_owned();
+        session.key_when(b"\x1b[A", name(index), move |text| {
+            text.lines().any(|line| {
+                let line = line.trim_matches('│').trim();
+                line.starts_with("› ") && line.contains(&expected)
+            })
         });
     }
     assert!(
-        session.screen().selected().contains(name(0)),
+        session.selected().contains(first),
         "did not scroll back to top"
     );
-    session.key_observed(b"/", "search-start", |screen| {
-        screen.text().contains("搜索过滤")
-    });
-    let mut filter = String::new();
-    for byte in b"Skill089" {
-        filter.push(*byte as char);
-        session.key_observed(&[*byte], &format!("filter-{filter}"), |screen| {
-            screen.text().contains(&format!("搜索过滤：{filter}（"))
-        });
+    let top_row = session.selected();
+    for _ in 0..6 {
+        session.key(b"\x1b[A");
+        session.step(b"T", "top-boundary barrier", "主题 Catppuccin Latte");
+        assert_eq!(session.selected(), top_row, "top-boundary moved row");
+        assert!(
+            session.child.try_wait().unwrap().is_none(),
+            "PTY child exited at top-boundary"
+        );
+        session.observations.push_str(&format!(
+            "top-boundary selected={top_row:?} alive=true frames={}\n",
+            session.screen().frames
+        ));
+        session.step(b"T", "top-boundary restore theme", "主题 Catppuccin Mocha");
+        assert_eq!(session.selected(), top_row);
     }
-    session.key_observed(b"\r", "search-confirmed", |screen| {
-        screen.selected().contains("Skill089") && !screen.text().contains("搜索过滤")
-    });
-    assert!(session.screen().selected().contains("Skill089"));
-    session.key_observed(b"\x1b", "back-home", |screen| {
-        screen.text().contains("Presets")
-    });
+    session.step(b"/", "search-start", "输入搜索词");
+    for byte in b"Skill089" {
+        session.key(&[*byte]);
+    }
+    session.step(b"\r", "search-confirmed", "Skill089");
+    assert!(session.selected().contains("Skill089"));
+    session.step(b"\x1b", "back-to-presets", "Skills 管理");
+    session.step(b"\x1b", "back-home", "全局");
     session.finish(&[]);
     passed(
         "long-list",
@@ -847,14 +1087,15 @@ fn pty_config_error_does_not_consume_pending_confirmation() {
         &fixture.targets[0],
     ]);
     let mut session = Session::start(&fixture, "config-error-pending");
-    session.key(b"d");
-    fixture.select(&mut session, &fixture.targets[..1], false);
+    fixture.enter_project(&mut session, 0);
+    fixture.preset_toggle_targets(&mut session, false);
+    session.step(b" ", "check target", "[x]");
+    session.step(b"\r", "preview disable", "影响预览");
     let before = packcaptain::storage::StateStore::load_existing_snapshot(&fixture.state).unwrap();
     let links = fixture.links(0);
     let config = fixture.projects[0].join(".claude/settings.local.json");
     fs::write(&config, "{broken-json").unwrap();
-    session.key(b"\r");
-    assert!(session.screen().text().contains("state is unknown"));
+    session.step(b"\r", "broken confirm", "state is unknown");
     assert_eq!(
         packcaptain::storage::StateStore::load_existing_snapshot(&fixture.state).unwrap(),
         before
@@ -862,12 +1103,11 @@ fn pty_config_error_does_not_consume_pending_confirmation() {
     assert_eq!(fixture.links(0), links);
     assert_eq!(fs::read(&config).unwrap(), b"{broken-json");
     fs::write(&config, "{}").unwrap();
-    session.key(b"\r");
+    session.step(b"\r", "retry confirm", "执行成功");
     assert!(
         fixture.links(0).is_empty(),
         "pending command must remain available after config error"
     );
-    assert!(session.screen().text().contains("执行成功"));
     session.finish(&[]);
     passed(
         "config-error-pending",
